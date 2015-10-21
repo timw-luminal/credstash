@@ -37,12 +37,10 @@ try:
 except ImportError:
     NO_YAML = True
 
+from boto3.dynamodb.conditions import Key, Attr
 from base64 import b64encode, b64decode
 from boto.dynamodb2.exceptions import ConditionalCheckFailedException
 from boto.dynamodb2.exceptions import ItemNotFound
-from boto.dynamodb2.fields import HashKey, RangeKey
-from boto.dynamodb2.table import Table
-from boto.dynamodb2.types import STRING
 from boto.kms.exceptions import InvalidCiphertextException
 from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
@@ -130,15 +128,18 @@ def getHighestVersion(name, region="us-east-1", table="credential-store"):
     '''
     Return the highest version of `name` in the table
     '''
-    secretStore = Table(table,
-                        connection=boto.dynamodb2.connect_to_region(region))
-    result_set = [x for x in secretStore.query_2(limit=1, reverse=True,
-                                                 consistent=True,
-                                                 name__eq=name)]
+    ddb = boto3.resource('dynamodb', region_name=region)
+    secretStore = ddb.Table(table)
+
+    result_set = secretStore.query(Limit=1,
+                                   ConsistentRead=True,
+                                   ScanIndexForward=False,
+                                   KeyConditionExpression=Key('name').eq(name))
+
     if not result_set:
         return 0
     else:
-        return result_set[0]["version"]
+        return result_set['Items'][0]['version']
 
 
 def listSecrets(region="us-east-1", table="credential-store"):
@@ -146,10 +147,11 @@ def listSecrets(region="us-east-1", table="credential-store"):
     do a full-table scan of the credential-store,
     and return the names and versions of every credential
     '''
-    secretStore = Table(table,
-                        connection=boto.dynamodb2.connect_to_region(region))
-    rs = secretStore.scan(attributes=("name", "version"))
-    return [secret for secret in rs]
+    ddb = boto3.resource('dynamodb', region_name=region)
+    secretStore = ddb.Table(table)
+
+    rs = secretStore.scan(AttributesToGet=['name', 'version'])
+    return [secret for secret in rs['Items']]
 
 
 def putSecret(name, secret, version, kms_key="alias/credstash",
@@ -179,8 +181,8 @@ def putSecret(name, secret, version, kms_key="alias/credstash",
     hmac = HMAC(hmac_key, msg=c_text, digestmod=SHA256)
     b64hmac = hmac.hexdigest()
 
-    secretStore = Table(table,
-                        connection=boto.dynamodb2.connect_to_region(region))
+    ddb = boto3.resource('dynamodb', region_name=region)
+    secretStore = ddb.Table(table)
 
     data = {}
     data['name'] = name
@@ -188,7 +190,7 @@ def putSecret(name, secret, version, kms_key="alias/credstash",
     data['key'] = b64encode(wrapped_key).decode('utf-8')
     data['contents'] = b64encode(c_text).decode('utf-8')
     data['hmac'] = b64hmac
-    return secretStore.put_item(data=data)
+    return secretStore.put_item(Item=data)
 
 
 def getAllSecrets(version="", region="us-east-1",
@@ -217,18 +219,21 @@ def getSecret(name, version="", region="us-east-1",
     '''
     if not context:
         context = {}
-    secretStore = Table(table,
-                        connection=boto.dynamodb2.connect_to_region(region))
+    ddb = boto3.resource('dynamodb', region_name=region)
+    secretStore = ddb.Table(table)
+
     if version == "":
-        # do a consistent fetch of the credential with the highest version
-        result_set = [x for x in secretStore.query_2(limit=1, reverse=True,
-                                                     consistent=True,
-                                                     name__eq=name)]
+        result_set = secretStore.query(Limit=1,
+                                       ConsistentRead=True,
+                                       ScanIndexForward=False,
+                                       KeyConditionExpression=Key('name').eq(name))
         if not result_set:
             raise ItemNotFound("Item {'name': '%s'} couldn't be found." % name)
-        material = result_set[0]
+        material = result_set['Items'][0]
+
     else:
-        material = secretStore.get_item(name=name, version=version)
+        result = secretStore.get_item(Key={'name': name, 'version': version})
+        material = result['Item']
 
     kms = boto3.client('kms', region_name=region)
     # Check the HMAC before we decrypt to verify ciphertext integrity
@@ -260,32 +265,56 @@ def getSecret(name, version="", region="us-east-1",
 
 
 def deleteSecrets(name, region="us-east-1", table="credential-store"):
-    secretStore = Table(table,
-                        connection=boto.dynamodb2.connect_to_region(region))
-    rs = secretStore.scan(name__eq=name)
-    for i in rs:
-        print("Deleting %s -- version %s" % (i["name"], i["version"]))
-        i.delete()
+    ddb = boto3.resource('dynamodb', region_name=region)
+    secretStore = ddb.Table(table)
 
+    rs = secretStore.scan(FilterExpression=Attr('name').eq(name),)
+    for i in rs['Items']:
+        print("Deleting %s -- version %s" % (i["name"], i["version"]))
+        secretStore.delete_item(Key={'name': i['name'], 'version': i['version']})
 
 def createDdbTable(region="us-east-1", table="credential-store"):
     '''
     create the secret store table in DDB in the specified region
     '''
-    d_conn = boto.dynamodb2.connect_to_region(region)
-    if table in d_conn.list_tables()['TableNames']:
+    ddb = boto3.client('dynamodb', region_name=region)
+    if table in ddb.list_tables()['TableNames']:
         print("Credential Store table already exists")
         return
     print("Creating table...")
-    secrets = Table.create(table, schema=[
-        HashKey('name', data_type=STRING),
-        RangeKey('version', data_type=STRING)
-        ], throughput={
-            'read': 1,
-            'write': 1
-        }, connection=d_conn)
+
+
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[
+            {
+                'AttributeName': 'name',
+                'KeyType': 'HASH'
+            },
+            {
+                'AttributeName': 'version',
+                'KeyType': 'RANGE'
+            }
+        ],
+        AttributeDefinitions=[
+            {
+                'AttributeName': 'name',
+                'AttributeType': 'S'
+            },
+            {
+                'AttributeName': 'version',
+                'AttributeType': 'S'
+            }
+        ],
+        ProvisionedThroughput={
+            'ReadCapacityUnits': 1,
+            'WriteCapacityUnits': 1
+        }
+
+    )
+
     timeout = 1
-    while secrets.describe()['Table']['TableStatus'] != "ACTIVE":
+    while ddb.describe_table(TableName=table)['Table']['TableStatus'] != "ACTIVE":
         print("Waiting for table to be created...")
         time.sleep(timeout)
         timeout = timeout * 2 if timeout < 8 else timeout
